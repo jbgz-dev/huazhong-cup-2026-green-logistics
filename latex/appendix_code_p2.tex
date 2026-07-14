@@ -1,0 +1,225 @@
+{\scriptsize
+\begin{verbatim}
+% =========================================================================
+% 问题二：环保政策约束下的双目标调度优化
+% 模型: TD-HVRPTW + 绿色区限行 + 时段分流 + epsilon-约束法
+% 算法: 自适应大邻域搜索 (ALNS) + Pareto前沿膝点分析
+% =========================================================================
+clear; clc; close all; warning off; rng(1);
+
+1. 数据预处理
+disp('===== 问题二：绿色政策调度 + 双目标优化引擎启动 =====');
+
+dist_matrix = readmatrix('距离矩阵.xlsx');
+dist_matrix(isnan(dist_matrix)) = 0;
+dist_matrix = max(dist_matrix, dist_matrix');
+
+coords_table = readtable('客户坐标信息.xlsx');
+coords = [coords_table{:,2}, coords_table{:,3}, coords_table{:,4}];
+n_cust = size(coords,1) - 1;
+
+orders = readtable('订单信息.xlsx');
+weight_col = fillmissing(orders{:,2}, 'constant', 0);
+volume_col = fillmissing(orders{:,3}, 'constant', 0);
+target_col = orders{:,4};
+
+demand_w = zeros(n_cust,1);
+demand_v = zeros(n_cust,1);
+for i = 1:n_cust
+    idx = (target_col == i);
+    demand_w(i) = sum(weight_col(idx));
+    demand_v(i) = sum(volume_col(idx));
+end
+
+tw_table = readtable('时间窗.xlsx');
+tw = zeros(n_cust, 2);
+for i = 1:n_cust
+    s = char(tw_table{i,2}); p = sscanf(s,'%d:%d'); tw(i,1) = p(1)*60+p(2);
+    s = char(tw_table{i,3}); p = sscanf(s,'%d:%d'); tw(i,2) = p(1)*60+p(2);
+end
+
+fprintf('数据加载完成: %d 客户, %d 订单\n', n_cust, height(orders));
+
+%% 1.5 需求拆分 — 超容量客户拆为多个虚拟客户
+MAX_CAP_W = 3000; MAX_CAP_V = 15.0;
+orig_n_cust = n_cust;
+orig_dw = demand_w; orig_dv = demand_v; orig_tw = tw;
+orig_coords = coords; orig_dist = dist_matrix;
+
+new_dw = []; new_dv = []; new_tw = []; new_coords_ext = [coords(1,:)];
+parent_map = [];
+for i = 1:orig_n_cust
+    w = orig_dw(i); v = orig_dv(i);
+    n_split = max(ceil(w / MAX_CAP_W), ceil(v / MAX_CAP_V));
+    sw_each = w / n_split;
+    sv_each = v / n_split;
+    for s = 1:n_split
+        new_dw(end+1,1) = sw_each; new_dv(end+1,1) = sv_each;
+        new_tw(end+1,:) = orig_tw(i,:);
+        new_coords_ext(end+1,:) = orig_coords(i+1,:);
+        parent_map(end+1) = i;
+    end
+end
+BIG_ONLY_W = 1500;
+BIG_ONLY_V = 10.8;
+LARGE_STOCK = 70;
+is_big_only = (new_dw > BIG_ONLY_W) | (new_dv > BIG_ONLY_V);
+while sum(is_big_only) > LARGE_STOCK
+    idxs = find(is_big_only);
+    [~, p] = min(new_dw(idxs) / MAX_CAP_W + new_dv(idxs) / MAX_CAP_V);
+    idx = idxs(p);
+    new_dw(idx) = new_dw(idx) / 2;
+    new_dv(idx) = new_dv(idx) / 2;
+    new_dw(end+1,1) = new_dw(idx); new_dv(end+1,1) = new_dv(idx);
+    new_tw(end+1,:) = new_tw(idx,:);
+    new_coords_ext(end+1,:) = new_coords_ext(idx+1,:);
+    parent_map(end+1) = parent_map(idx);
+    is_big_only = (new_dw > BIG_ONLY_W) | (new_dv > BIG_ONLY_V);
+end
+n_cust = length(new_dw);
+demand_w = new_dw; demand_v = new_dv; tw = new_tw; coords = new_coords_ext;
+new_dist = zeros(n_cust+1);
+for i = 0:n_cust
+    pi = 0; if i>0, pi = parent_map(i); end
+    for j = 0:n_cust
+        pj = 0; if j>0, pj = parent_map(j); end
+        new_dist(i+1, j+1) = orig_dist(pi+1, pj+1);
+    end
+end
+dist_matrix = new_dist;
+fprintf('需求拆分: %d -> %d 虚拟客户\n', orig_n_cust, n_cust);
+
+2. 绿色配送区识别
+cx = coords(2:end, 2);
+cy = coords(2:end, 3);
+dist_to_center = sqrt(cx.^2 + cy.^2);
+R_GREEN = 10;
+is_green = dist_to_center <= R_GREEN;
+green_custs = find(is_green);
+normal_custs = find(~is_green);
+fprintf('绿色区客户: %d 个, 常规区客户: %d 个\n', length(green_custs), length(normal_cu...
+    sts));
+
+3. 车型定义与政策参数
+% [载重kg, 容积m3, 启动成本, 满载修正, 碳排系数kg/L或kg/kWh, 能源单价, 是否燃油, 库存]
+VT = [
+    3000, 13.5, 400, 0.40, 2.547, 7.61, 1, 60;
+    1500, 10.8, 400, 0.40, 2.547, 7.61, 1, 50;
+    1250,  6.5, 400, 0.40, 2.547, 7.61, 1, 50;
+    3000, 15.0, 400, 0.35, 0.501, 1.64, 0, 10;
+    1250,  8.5, 400, 0.35, 0.501, 1.64, 0, 15;
+];
+n_vtype = size(VT,1);
+
+CARBON_PRICE = 0.65;
+EARLY_PEN    = 20/60;
+LATE_PEN     = 50/60;
+SERVICE_TIME = 20;
+T_START      = 480;          % 8:00
+T_FORBID_END = 960;          % 16:00 限行结束
+
+4. ALNS 参数
+ALNS_ITER    = 2000;
+N_DESTROY    = 3;
+N_REPAIR     = 2;
+SIGMA        = [33, 9, 3];
+REACT_FACTOR = 0.1;
+DESTROY_RATE = [0.1, 0.4];
+SA_T0        = 1000;
+SA_COOL      = 0.9995;
+
+5. epsilon-约束法双目标扫描
+N_EPSILON = 8;
+
+disp('>>> 锚点1: 求解成本最优解...');
+[sol_cost_opt, cost_opt, det_cost, carb_cost_opt, hist_cost] = ...
+    run_alns_q2(n_cust, demand_w, demand_v, tw, dist_matrix, coords, VT, .....
+        .
+    CARBON_PRICE, EARLY_PEN, LATE_PEN, SERVICE_TIME, T_START, ...
+    is_green, T_FORBID_END, ALNS_ITER, SIGMA, REACT_FACTOR, DESTROY_RATE, S...
+        A_T0, SA_COOL, ...
+    'cost', inf);
+fprintf('  成本最优: 总成本=%.2f 元, 碳排=%.2f kg\n', cost_opt, carb_cost_opt);
+
+disp('>>> 锚点2: 求解碳排最优解...');
+[sol_carb_opt, cost_carb_opt, det_carb, carb_min, hist_carb] = ...
+    run_alns_q2(n_cust, demand_w, demand_v, tw, dist_matrix, coords, VT, .....
+        .
+    CARBON_PRICE, EARLY_PEN, LATE_PEN, SERVICE_TIME, T_START, ...
+    is_green, T_FORBID_END, ALNS_ITER, SIGMA, REACT_FACTOR, DESTROY_RATE, S...
+        A_T0, SA_COOL, ...
+    'carbon', inf);
+fprintf('  碳排最优: 总成本=%.2f 元, 碳排=%.2f kg\n', cost_carb_opt, carb_min);
+
+pareto_costs   = [cost_opt; cost_carb_opt];
+pareto_carbons = [carb_cost_opt; carb_min];
+pareto_sols    = {sol_cost_opt; sol_carb_opt};
+pareto_details = [det_cost; det_carb];
+
+eps_vals = linspace(carb_min, carb_cost_opt, N_EPSILON+2);
+eps_vals = eps_vals(2:end-1);
+
+prev_sol = sol_cost_opt;
+for ep_i = 1:N_EPSILON
+    fprintf('>>> Pareto扫描 %d/%d: 碳排上界=%.1f kg\n', ep_i, N_EPSILON, eps_vals...
+        (ep_i));
+    [s_ep, c_ep, d_ep, cb_ep, ~] = ...
+        run_alns_q2(n_cust, demand_w, demand_v, tw, dist_matrix, coords, VT...
+            , ...
+        CARBON_PRICE, EARLY_PEN, LATE_PEN, SERVICE_TIME, T_START, ...
+        is_green, T_FORBID_END, ALNS_ITER, SIGMA, REACT_FACTOR, DESTROY_RAT...
+            E, SA_T0, SA_COOL, ...
+        'cost', eps_vals(ep_i), prev_sol);
+    pareto_costs(end+1)   = c_ep;
+    pareto_carbons(end+1) = cb_ep;
+    pareto_sols{end+1}    = s_ep;
+    pareto_details(end+1,:) = d_ep;
+    prev_sol = s_ep;
+    fprintf('  => 成本=%.2f, 碳排=%.2f\n', c_ep, cb_ep);
+end
+
+6. Pareto前沿提取与膝点检测
+[pareto_carbons_s, si] = sort(pareto_carbons);
+pareto_costs_s   = pareto_costs(si);
+pareto_details_s = pareto_details(si,:);
+pareto_sols_s    = pareto_sols(si);
+
+pf_mask = true(size(pareto_costs_s));
+for i = 1:length(pareto_costs_s)
+    for j = 1:length(pareto_costs_s)
+        if i~=j && pareto_costs_s(j)<=pareto_costs_s(i) && pareto_carbons_s...
+            (j)<=pareto_carbons_s(i)
+            if pareto_costs_s(j)<pareto_costs_s(i) || pareto_carbons_s(j)<p...
+                areto_carbons_s(i)
+                pf_mask(i) = false; break;
+            end
+        end
+    end
+end
+pf_costs   = pareto_costs_s(pf_mask);
+pf_carbons = pareto_carbons_s(pf_mask);
+pf_details = pareto_details_s(pf_mask,:);
+pf_sols    = pareto_sols_s(pf_mask);
+
+knee_idx = 1;
+if length(pf_costs) >= 3
+    cn = (pf_costs - min(pf_costs)) / max(max(pf_costs)-min(pf_costs), 1);
+    en = (pf_carbons - min(pf_carbons)) / max(max(pf_carbons)-min(pf_carbon...
+        s), 1);
+    p1 = [en(1), cn(1)]; p2 = [en(end), cn(end)];
+    lv = p2 - p1; ll = norm(lv);
+    md = 0;
+    for i = 2:length(pf_costs)-1
+        pt = [en(i), cn(i)];
+        d = abs(det([lv; pt-p1])) / ll;
+        if d > md, md = d; knee_idx = i; end
+    end
+end
+
+best_sol    = pf_sols{knee_idx};
+best_cost   = pf_costs(knee_idx);
+best_carbon = pf_carbons(knee_idx);
+best_detail = pf_details(knee_idx,:);
+
+\end{verbatim}
+}

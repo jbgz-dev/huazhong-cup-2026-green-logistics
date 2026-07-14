@@ -1,0 +1,260 @@
+{\scriptsize
+\begin{verbatim}
+% =========================================================================
+% 问题一：静态调度 (TD-HVRPTW + ALNS)
+% 时变软时间窗异构车辆路径模型 + 自适应大邻域搜索算法
+% =========================================================================
+clear; clc; close all; warning off; rng(1);
+
+1. 数据预处理
+
+disp('===== 问题一：TD-HVRPTW + ALNS 求解引擎启动 =====');
+
+dist_matrix = readmatrix('距离矩阵.xlsx');
+dist_matrix(isnan(dist_matrix)) = 0;
+dist_matrix = max(dist_matrix, dist_matrix');
+
+coords_table = readtable('客户坐标信息.xlsx');
+coords = [coords_table{:,2}, coords_table{:,3}, coords_table{:,4}];
+n_cust = size(coords,1) - 1;
+
+orders = readtable('订单信息.xlsx');
+weight_col = fillmissing(orders{:,2}, 'constant', 0);
+volume_col = fillmissing(orders{:,3}, 'constant', 0);
+target_col = orders{:,4};
+
+demand_w = zeros(n_cust,1);
+demand_v = zeros(n_cust,1);
+for i = 1:n_cust
+    idx = (target_col == i);
+    demand_w(i) = sum(weight_col(idx));
+    demand_v(i) = sum(volume_col(idx));
+end
+
+tw_table = readtable('时间窗.xlsx');
+tw = zeros(n_cust, 2);
+for i = 1:n_cust
+    s = char(tw_table{i,2}); p = sscanf(s,'%d:%d'); tw(i,1) = p(1)*60+p(2);
+    s = char(tw_table{i,3}); p = sscanf(s,'%d:%d'); tw(i,2) = p(1)*60+p(2);
+end
+
+fprintf('数据加载完成: %d 客户, %d 订单\n', n_cust, height(orders));
+
+%% 1.5 需求拆分 — 超容量客户拆为多个虚拟客户
+MAX_CAP_W = 3000;  % 最大车辆载重
+MAX_CAP_V = 15.0;  % 最大车辆容积
+orig_n_cust = n_cust;
+orig_demand_w = demand_w;
+orig_demand_v = demand_v;
+orig_tw = tw;
+orig_coords = coords;
+orig_dist = dist_matrix;
+
+new_dw = []; new_dv = []; new_tw = []; new_coords_ext = [coords(1,:)];
+parent_map = [];
+
+for i = 1:orig_n_cust
+    w = orig_demand_w(i); v = orig_demand_v(i);
+    n_split = max(ceil(w / MAX_CAP_W), ceil(v / MAX_CAP_V));
+    sw_each = w / n_split;
+    sv_each = v / n_split;
+    for s = 1:n_split
+        new_dw(end+1,1) = sw_each;
+        new_dv(end+1,1) = sv_each;
+        new_tw(end+1,:) = orig_tw(i,:);
+        new_coords_ext(end+1,:) = orig_coords(i+1,:);
+        parent_map(end+1) = i;
+    end
+end
+
+% 二次拆分：控制只能由3吨大车服务的虚拟客户数量，避免大车库存不足
+BIG_ONLY_W = 1500;
+BIG_ONLY_V = 10.8;
+LARGE_STOCK = 70;
+is_big_only = (new_dw > BIG_ONLY_W) | (new_dv > BIG_ONLY_V);
+while sum(is_big_only) > LARGE_STOCK
+    idxs = find(is_big_only);
+    [~, p] = min(new_dw(idxs) / MAX_CAP_W + new_dv(idxs) / MAX_CAP_V);
+    idx = idxs(p);
+    new_dw(idx) = new_dw(idx) / 2;
+    new_dv(idx) = new_dv(idx) / 2;
+    new_dw(end+1,1) = new_dw(idx);
+    new_dv(end+1,1) = new_dv(idx);
+    new_tw(end+1,:) = new_tw(idx,:);
+    new_coords_ext(end+1,:) = new_coords_ext(idx+1,:);
+    parent_map(end+1) = parent_map(idx);
+    is_big_only = (new_dw > BIG_ONLY_W) | (new_dv > BIG_ONLY_V);
+end
+
+n_cust = length(new_dw);
+demand_w = new_dw;
+demand_v = new_dv;
+tw = new_tw;
+coords = new_coords_ext;
+
+new_dist = zeros(n_cust+1);
+for i = 0:n_cust
+    pi = 0; if i>0, pi = parent_map(i); end
+    for j = 0:n_cust
+        pj = 0; if j>0, pj = parent_map(j); end
+        new_dist(i+1, j+1) = orig_dist(pi+1, pj+1);
+    end
+end
+dist_matrix = new_dist;
+
+fprintf('需求拆分: %d 原始客户 -> %d 虚拟客户 (拆分了 %d 个超容量客户)\n', ...
+    orig_n_cust, n_cust, n_cust - orig_n_cust);
+fprintf('虚拟客户需求分布: 重量 min=%.0f max=%.0f mean=%.0f | 体积 min=%.1f max=%.1f mean=%.1f\n'...
+    , ...
+    min(new_dw), max(new_dw), mean(new_dw), min(new_dv), max(new_dv), mean(new_dv));
+fprintf('总需求: 重量=%.0fkg 体积=%.1fm3 | 大车(3t)理论最少=%.0f辆\n', ...
+    sum(new_dw), sum(new_dv), ceil(sum(new_dw)/3000));
+
+2. 车型定义 (题目原始参数)
+% [载重kg, 容积m3, 启动成本, 满载修正, 碳排转换系数, 能源单价, 是否燃油, 库存]
+VT = [
+    3000, 13.5, 400, 0.40, 2.547, 7.61, 1, 60;   % 燃油大
+    1500, 10.8, 400, 0.40, 2.547, 7.61, 1, 50;   % 燃油中
+    1250,  6.5, 400, 0.40, 2.547, 7.61, 1, 50;   % 燃油小
+    3000, 15.0, 400, 0.35, 0.501, 1.64, 0, 10;   % 电动大
+    1250,  8.5, 400, 0.35, 0.501, 1.64, 0, 15;   % 电动小
+];
+n_vtype = size(VT,1);
+
+% 成本参数
+CARBON_PRICE = 0.65;       % 碳排放成本 (元/kg)
+EARLY_PEN    = 20/60;      % 早到惩罚 (元/分钟) = 20元/小时
+LATE_PEN     = 50/60;      % 晚到惩罚 (元/分钟) = 50元/小时
+SERVICE_TIME = 20;         % 服务时间 (分钟)
+T_START      = 480;        % 出发时刻 8:00 = 480min
+
+3. ALNS 参数
+ALNS_ITER    = 3000;       % 总迭代次数
+N_DESTROY    = 3;          % 破坏算子数
+N_REPAIR     = 2;          % 修复算子数
+SIGMA        = [33, 9, 3]; % 奖励分数: 全局最优/当前改进/接受
+REACT_FACTOR = 0.1;        % 权重反应因子
+DESTROY_RATE = [0.1, 0.4]; % 移除比例范围
+SA_T0        = 1000;       % SA初始温度
+SA_COOL      = 0.9995;     % SA冷却率
+
+4. 构造初始解 (贪婪插入)
+disp('>>> 构造初始可行解...');
+sol = greedy_init(n_cust, demand_w, demand_v, tw, dist_matrix, VT, T_START, SERVICE_T...
+    IME);
+[sol_cost, sol_detail, ~] = eval_solution(sol, dist_matrix, VT, demand_w, tw, ...
+    CARBON_PRICE, EARLY_PEN, LATE_PEN, SERVICE_TIME, T_START);
+cust_per_veh = arrayfun(@(s) length(s.path), sol);
+fprintf('初始解: %.2f 元, %d 辆车, 平均每车%.1f客户, 最多%d客户\n', ...
+    sol_cost, length(sol), mean(cust_per_veh), max(cust_per_veh));
+vt_init = zeros(1,n_vtype);
+for rr=1:length(sol), vt_init(sol(rr).vtype)=vt_init(sol(rr).vtype)+1; end
+fprintf('初始车型分布: 燃油大=%d/%d 燃油中=%d/%d 燃油小=%d/%d 电动大=%d/%d 电动小=%d/%d\n', ...
+    vt_init(1),VT(1,8), vt_init(2),VT(2,8), vt_init(3),VT(3,8), vt_init(4),VT(4,8), v...
+        t_init(5),VT(5,8));
+
+5. ALNS 主循环
+disp('>>> ALNS 求解中...');
+[~, ~, init_carbon] = eval_solution(sol, dist_matrix, VT, demand_w, tw, ...
+    CARBON_PRICE, EARLY_PEN, LATE_PEN, SERVICE_TIME, T_START);
+best_sol = sol; best_cost = sol_cost; best_detail = sol_detail; best_carbon = init_ca...
+    rbon;
+curr_sol = sol; curr_cost = sol_cost;
+
+w_destroy = ones(1, N_DESTROY); w_repair = ones(1, N_REPAIR);
+score_d = zeros(1, N_DESTROY); score_r = zeros(1, N_REPAIR);
+count_d = zeros(1, N_DESTROY); count_r = zeros(1, N_REPAIR);
+sa_temp = SA_T0;
+
+cost_history = zeros(ALNS_ITER, 1);
+best_history = zeros(ALNS_ITER, 1);
+
+for iter = 1:ALNS_ITER
+    % 自适应选择算子
+    d_op = roulette_select(w_destroy);
+    r_op = roulette_select(w_repair);
+
+    % 确定移除数量
+    n_remove = max(1, round(n_cust * (DESTROY_RATE(1) + rand()*(DESTROY_RATE(2)-DESTR...
+        OY_RATE(1)))));
+
+    % 破坏
+    [removed, partial] = destroy(curr_sol, d_op, n_remove, dist_matrix, demand_w, tw)...
+        ;
+
+    % 修复
+    try
+        new_sol = repair(partial, removed, r_op, dist_matrix, VT, demand_w, demand_v,...
+             tw, ...
+            CARBON_PRICE, EARLY_PEN, LATE_PEN, SERVICE_TIME, T_START);
+    catch
+        reward = 0;
+        score_d(d_op) = score_d(d_op) + reward;
+        count_d(d_op) = count_d(d_op) + 1;
+        score_r(r_op) = score_r(r_op) + reward;
+        count_r(r_op) = count_r(r_op) + 1;
+        sa_temp = sa_temp * SA_COOL;
+        cost_history(iter) = curr_cost;
+        best_history(iter) = best_cost;
+        continue;
+    end
+
+    [new_cost, new_detail, new_carbon] = eval_solution(new_sol, dist_matrix, VT, dema...
+        nd_w, tw, ...
+        CARBON_PRICE, EARLY_PEN, LATE_PEN, SERVICE_TIME, T_START);
+
+    % 库存与容量约束检查
+    feasible_ok = check_solution_feasible(new_sol, VT, demand_w, demand_v);
+
+    % 评价与接受
+    reward = 0;
+    if feasible_ok && new_cost < best_cost
+        best_sol = new_sol; best_cost = new_cost; best_detail = new_detail; best_carb...
+            on = new_carbon;
+        curr_sol = new_sol; curr_cost = new_cost;
+        reward = SIGMA(1);
+    elseif feasible_ok && new_cost < curr_cost
+        curr_sol = new_sol; curr_cost = new_cost;
+        reward = SIGMA(2);
+    elseif feasible_ok && rand() < exp(-(new_cost - curr_cost)/sa_temp)
+        curr_sol = new_sol; curr_cost = new_cost;
+        reward = SIGMA(3);
+    end
+
+    score_d(d_op) = score_d(d_op) + reward;
+    count_d(d_op) = count_d(d_op) + 1;
+    score_r(r_op) = score_r(r_op) + reward;
+    count_r(r_op) = count_r(r_op) + 1;
+
+    sa_temp = sa_temp * SA_COOL;
+    cost_history(iter) = curr_cost;
+    best_history(iter) = best_cost;
+
+    % 每100次更新权重
+    if mod(iter, 100) == 0
+        for d = 1:N_DESTROY
+            if count_d(d) > 0
+                w_destroy(d) = w_destroy(d)*(1-REACT_FACTOR) + REACT_FACTOR*score_d(d...
+                    )/count_d(d);
+            end
+        end
+        for r = 1:N_REPAIR
+            if count_r(r) > 0
+                w_repair(r) = w_repair(r)*(1-REACT_FACTOR) + REACT_FACTOR*score_r(r)/...
+                    count_r(r);
+            end
+        end
+        w_destroy = max(w_destroy, 0.05); w_repair = max(w_repair, 0.05);
+        score_d(:)=0; count_d(:)=0; score_r(:)=0; count_r(:)=0;
+    end
+
+    if mod(iter, 500) == 0
+        fprintf('  迭代 %d/%d | 当前: %.2f | 最优: %.2f | 车辆: %d\n', ...
+            iter, ALNS_ITER, curr_cost, best_cost, length(best_sol));
+    end
+end
+
+disp('===== ALNS 求解完毕 =====');
+
+\end{verbatim}
+}
